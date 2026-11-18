@@ -1,5 +1,6 @@
 #define SACREDFIRE_RELEASE "v9.9.9"
 #include "../src/runtime_public_itemless.c"
+#include "../src/runtime_text.c"
 #include <assert.h>
 #include <unistd.h>
 static int sent, dialogs, status = 200, stopped, returned, early, forwarded, requests, private_room;
@@ -8,6 +9,9 @@ static int party_guest=1;
 int runtime_room_mode_following(void) { return party_guest; }
 static int frozen_race;
 int runtime_room_mode_race_frozen(void) { return frozen_race; }
+void runtime_party_host_lost(int role,int private_match,int announced_return) {
+    (void)role;(void)private_match;(void)announced_return;
+}
 static void *focus_test_button;
 static unsigned synthetic_signal;
 static int hof_opens;
@@ -17,6 +21,8 @@ static int hof_input_handled, hof_input_signal;
 int runtime_hof_input(void *placeable, unsigned signal) { (void)placeable; hof_input_signal = signal; return hof_input_handled; }
 static int ranked_status_state = 1;
 int runtime_ranked_status(int fresh) { (void)fresh; return ranked_status_state; }
+static int ranked_account_state = 1;
+int runtime_ranked_account(void) { return ranked_account_state; }
 int runtime_private_difficulty_modified(void) { return modified_difficulty; }
 int runtime_online_mode_private_cup(void) { return private_cup; }
 int runtime_online_mode_private_teams(void) { return private_teams; }
@@ -127,12 +133,14 @@ static void test_full_lobby_confirmation(void) {
     snprintf(doc+n, sizeof doc-n, ",%016" PRIx64 "\"}", (uint64_t)17);
     assert(!confirmation(doc,42,1));
 }
-static int native_party_teardowns, native_keep_party, native_race_resets, native_lobby_closes;
+static int native_party_teardowns, native_keep_party, native_race_resets, native_lobby_closes, native_session_releases, native_session_stops;
 static void ABI native_close_lobby(int start_again) { assert(!start_again && native_keep_party==1 && native_race_resets);++native_lobby_closes; }
 static void ABI native_reset_session(void *self) { (void)self;assert(native_keep_party==1);++native_race_resets; }
 static void ABI native_stop_part(void *self) { (void)self; }
 static void ABI native_stop_party(void *self) { (void)self; ++native_party_teardowns; }
 static void ABI native_stop_session(void *self, int keep_party) { (void)self; native_keep_party=keep_party; }
+static void ABI native_release_session(void *self) { assert(self); ++native_session_releases; }
+static void ABI native_stop_session_object(void *self) { assert(self); ++native_session_stops; }
 static void test_installed_hooks(const char *region) {
     size_t size=0x2af3000;
     unsigned char *im=mmap(NULL,size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
@@ -159,8 +167,13 @@ static void test_installed_hooks(const char *region) {
     memcpy(im+0xa5b692,"\x48\x83\xc4\x30\x5b\x41\x5e\x5d\xb0\x01\xc3",11);
     memcpy(im+0xa18210,"\x55\x48\x89\xe5\x53\x50\x48\x89\xfb\x83\x7b\x54\x0a\x0f\x84\x93\x00\x00\x00",19);
     /* Both reset branches unwind the stolen prologue; quit does the same. */
-    memcpy(im+0xa18223,"\x58\x5b\x5d\xc3",4);
+    memcpy(im+0xa18223,"\x48\x8b\x7b\x18\x48\x85\xff\x74\x1f\x48\x8b\x07\xff\x90\xb8\x00\x00\x00",18);
     memcpy(im+0xa182b6,"\x58\x5b\x5d\xc3",4);
+    memcpy(im+0xa18235,"\x48\x8b\x7b\x18\x48\xc7\x43\x18\x00\x00\x00\x00\x48\x85\xff\x74\x05\xe8",18);
+    int32_t release_relative=(int32_t)(0x149d260-0xa1824b);
+    memcpy(im+0xa18247,&release_relative,4);
+    memcpy(im+0xa1824b,"\x58\x5b\x5d\xc3",4);
+    jump(im+0x149d260,(void *)native_release_session);
     memcpy(im+0xa9ffd0,prefix,16);im[0xa9ffe0]=0x28;
     memcpy(im+0xa9ffe1,"\x48\x83\xc4\x28\x5b\x41\x5c\x41\x5d\x41\x5e\x41\x5f\x5d\xc3",15);
     memcpy(im+0xaa06a0,"\x55\x48\x89\xe5\x41\x57\x41\x56\x53\x48\x83\xec\x18",13);
@@ -187,6 +200,19 @@ static void test_installed_hooks(const char *region) {
     assert(!memcmp(im+0xa97a00,stop_native,sizeof stop_native));
     unsigned char trace_party[0x80]={0};
     ((void (ABI *)(void *))(im+0xa18210))(trace_party);
+    unsigned char dead_session[0x120]={0};
+    *(void **)(trace_party+0x18)=dead_session;
+    int releases=native_session_releases;
+    ((void (ABI *)(void *))(im+0xa18210))(trace_party);
+    assert(!*(void **)(trace_party+0x18) && native_session_releases==releases+1);
+    void *live_vtable[24]={0};
+    jump(im+0x100000,(void *)native_stop_session_object);
+    live_vtable[23]=im+0x100000;
+    *(void **)dead_session=live_vtable;
+    *(void **)(trace_party+0x18)=dead_session;
+    int stops=native_session_stops;
+    ((void (ABI *)(void *))(im+0xa18210))(trace_party);
+    assert(!*(void **)(trace_party+0x18) && native_session_stops==stops+1 && native_session_releases==releases+2);
     *(int *)(trace_party+0x54)=10;
     ((void (ABI *)(void *))(im+0xa18210))(trace_party);
     ((void (ABI *)(void *))(im+0xa9ffd0))(trace_party);
@@ -499,6 +525,7 @@ static void test_native_return_focus(void) {
         online_return_button = selection;
         int before = forwarded;
         matchmaking_search=searching=1;
+        menu_party_returned=0;
         const int saved_mode=selected,saved_ranked=ranked_selected;
         placeable_event(root, event);
         assert(!matchmaking_search && !searching && selected==saved_mode && ranked_selected==saved_ranked);
@@ -529,6 +556,12 @@ static void test_native_return_focus(void) {
     for (unsigned off = 0x90; off <= 0xb8; off += 8) release_handle((void **)(fields + off));
     assert(handles == 0);
 }
+static int account_notices;
+static void ABI account_notice(const char *body, void *options) {
+    assert(options == NULL && strstr(body, "Discord or Steam"));
+    ++account_notices;
+}
+
 static void test_ranked_season_gate(void) {
     native_placeable_event = forward_event;
     native_make_handle = make_test_handle;
@@ -568,6 +601,28 @@ static void test_ranked_season_gate(void) {
         memcpy(&alpha, button + 0xe0, 4);
         assert(alpha == 1.0f);
     }
+    /* No Discord or Steam account linked: Ranked is open, but Go to Lobby tells the player and
+     * stays (dimmed), directly and after a deferred status check. */
+    {
+        Notice saved_notice = native_notice;
+        native_notice = account_notice;
+        ranked_account_state = 0;
+        ranked_status_state = 1;
+        int before = forwarded, shown = account_notices;
+        placeable_event(button, event);
+        assert(forwarded == before && account_notices == shown + 1 && !pending_private.target);
+        runtime_ranked_gate_update(button, 1);
+        float alpha; memcpy(&alpha, button + 0xe0, 4);
+        assert(alpha == 0.45f);
+        ranked_status_state = -1;
+        placeable_event(button, event);
+        assert(forwarded == before && pending_private.ranked);
+        ranked_status_state = 1;
+        assert(!runtime_private_party_update());
+        assert(forwarded == before && account_notices == shown + 2 && !pending_private.target && handles == 0);
+        ranked_account_state = 1;
+        native_notice = saved_notice;
+    }
     /* Back cancels the deferred entry even when status later opens. */
     ranked_status_state = -1;
     placeable_event(button, event);
@@ -579,14 +634,20 @@ static void test_ranked_season_gate(void) {
     assert(forwarded == before && handles == 0);
     ranked_selected = 0;
     selected = 0;
-    /* Into the private room from the mode screen: the party is counted there, before anyone joins. */
+    /* Opening mode selection is not entering a private lobby; keep current party intact. */
+    graph_meta[2] = "Scripts.Graph.Octane_Lobby_Main_PrivateMatchButton";
     event[3] = (void *)8;
+    private_room = 0;
+    menu_party_returned = 1;
+    placeable_event(button, event);
+    assert(menu_party_returned && !entry_private);
+    /* Into the private room from the mode screen: the party is counted there, before anyone joins. */
+    graph_meta[2] = "Scripts.Graph.Octane_Lobby_ModeSelect_GoToLobbyButton";
     private_room = 1;
     menu_party_returned = 1; party_at_entry = 5;
     placeable_event(button, event);
     assert(!menu_party_returned && party_at_entry == ranked_party_size() && entry_private);
-    assert(private_lobby_entered);
-    private_room = 0; entry_private = 0; private_lobby_entered = 0;
+    private_room = 0; entry_private = 0;
 }
 
 static void test_hall_of_fame_button_event(void) {
@@ -888,17 +949,19 @@ static void test_cancelled_and_duplicate_lobby_entries(void) {
 
 static int party_returns;
 static void ABI return_party_mock(void *party) { assert(party); ++party_returns; }
-static int quits;
-static void ABI quit_party_mock(void *party) { assert(party); ++quits; }
+static int party_quits;
+static void ABI quit_party_mock(void *party) { assert(party);++party_quits; }
 static void test_native_party_menu_return(void) {
     unsigned char party[0x80]={0},session[0x20]={0},connection[0x120]={0};
     void *party_value=party,*network_value=test_network;
     void **saved_party=party_manager,**saved_network=network_manager;
     void (ABI *saved_return)(void *)=native_party_return;
+    void (ABI *saved_quit)(void *)=native_party_quit_trace;
     void (ABI *saved_stop)(void *)=native_stop_matchmaking;
     int saved_guest=party_guest,old_stops=stopped,old_returns=party_returns;
     party_manager=&party_value;network_manager=&network_value;
-    native_party_return=return_party_mock;native_stop_matchmaking=stop_matchmaking;
+    native_party_return=return_party_mock;native_party_quit_trace=quit_party_mock;
+    native_stop_matchmaking=stop_matchmaking;party_quits=0;
     *(void **)(party+0x18)=session;*(void **)(session+0x10)=connection;
     *(int *)(connection+0x118)=1;party[0x6c]=1;
     party_guest=0;menu_party_returned=0;
@@ -931,7 +994,7 @@ static void test_native_party_menu_return(void) {
     placeable_event(root,event);
     native_placeable_event=saved_event;
     assert(party_returns==old_returns+1 && stopped==old_stops+1);
-    assert(*party_manager==party && party[0x6c] && selected && ranked_selected);
+    assert(*party_manager==party && !party[0x6c] && selected && ranked_selected);
     assert(!search_mark && !matchmaking_search && !search_server_active && !matchmaking_room);
     strcpy(reply,"{\"state\":\"searching\",\"elapsed\":99,\"timeout\":180,\"range\":400,\"ranked\":true}");
     search_poll(job);assert(!search_mark && !search_server_active);
@@ -961,27 +1024,15 @@ static void test_native_party_menu_return(void) {
         /* A private room: nobody comes along, not even a party that came in together. */
         menu_party_returned=0;party_at_entry=2;entry_private=1;
         runtime_public_itemless_menu_return();
-        assert(party_returns==returns+1);
+        assert(party_returns==returns+1 && party_quits==1);
         /* The next search is not a private room any more. */
         arm_party_return();assert(!entry_private && !menu_party_returned);
         party_at_entry=1;
-        /* Back on the mode screen from a private lobby as its host with a player in the party:
-         * the party is disbanded once; not without the lobby, a player or as a guest. */
-        unsigned char member[0x30]={0},roster[0x28]={0};
-        void *members[]={member};
-        *(int *)(roster+12)=1;*(void ***)(roster+0x20)=members;*(void **)(party+0x30)=roster;
-        void (ABI *saved_quit)(void *)=native_party_quit_trace;
-        native_party_quit_trace=quit_party_mock;quits=0;
-        private_lobby_entered=0;leave_private_party();assert(quits==0);
-        private_lobby_entered=1;leave_private_party();assert(quits==1 && !private_lobby_entered);
-        leave_private_party();assert(quits==1);
-        *(int *)(connection+0x118)=2;private_lobby_entered=1;leave_private_party();assert(quits==1);
-        *(int *)(connection+0x118)=1;*(int *)(roster+12)=0;private_lobby_entered=1;leave_private_party();assert(quits==1);
-        *(void **)(party+0x30)=NULL;native_party_quit_trace=saved_quit;
     }
     runtime_public_itemless_reset();
     party_guest=saved_guest;party_manager=saved_party;network_manager=saved_network;
     native_party_return=saved_return;native_stop_matchmaking=saved_stop;
+    native_party_quit_trace=saved_quit;
     stopped=old_stops;selected=ranked_selected=0;strcpy(reply,"ok");
 }
 
@@ -1253,6 +1304,7 @@ int main(void) {
     pthread_mutex_unlock(&http_lock);
     for (int i=0;i<100;++i) assert(compatibility_check(target,response,sizeof response)==-1);
     /* A slow or expired HTTP check must never cancel public matchmaking. */
+    party_manager=NULL; /* the party tests above pointed at their own stack managers */
     native_search=send_search;
     runtime_public_itemless_select(1);
     int searches=sent, notices=dialogs, stops=stopped, http_requests=requests;
