@@ -3,15 +3,17 @@
 #include "../src/runtime_text.c"
 #include <assert.h>
 #include <unistd.h>
-static int sent, dialogs, status = 200, stopped, returned, early, forwarded, requests, private_room;
+static int sent, dialogs, status = 200, stopped, returned, early, forwarded, requests, private_room, ranked_notices;
 static int private_speed, private_cup, private_teams, modified_difficulty, selector_left_calls;
 static int party_guest=1;
 int runtime_room_mode_following(void) { return party_guest; }
 static int frozen_race;
 int runtime_room_mode_race_frozen(void) { return frozen_race; }
+static int host_lost_return;
 void runtime_party_host_lost(int role,int private_match,int announced_return) {
-    (void)role;(void)private_match;(void)announced_return;
+    (void)role;(void)private_match;host_lost_return=announced_return;
 }
+static void ABI reset_mock(void *party) { (void)party; }
 static void *focus_test_button;
 static unsigned synthetic_signal;
 static int hof_opens;
@@ -23,6 +25,8 @@ static int ranked_status_state = 1;
 int runtime_ranked_status(int fresh) { (void)fresh; return ranked_status_state; }
 static int ranked_account_state = 1;
 int runtime_ranked_account(void) { return ranked_account_state; }
+static const char *online_content_state = "clean";
+const char *runtime_online_content(void) { return online_content_state; }
 int runtime_private_difficulty_modified(void) { return modified_difficulty; }
 int runtime_online_mode_private_cup(void) { return private_cup; }
 int runtime_online_mode_private_teams(void) { return private_teams; }
@@ -90,6 +94,7 @@ static void ABI show(const char *body, void *options) {
     assert(options==NULL); /* Exactly the offline Online-entry notice configuration. */
     snprintf(message,sizeof message,"%s",body); ++dialogs;
 }
+static void ABI count_notice(const char *body, void *options) { assert(body && !options); ++ranked_notices; }
 
 static void *ABI send_search(void **out, void *self, const char *doc, unsigned n, void *result) {
     (void)self;(void)result; assert(strlen(doc)<n);
@@ -562,6 +567,40 @@ static void ABI account_notice(const char *body, void *options) {
     ++account_notices;
 }
 
+static int content_notices;
+static void ABI content_notice(const char *body, void *options) {
+    assert(options == NULL && strstr(body, "character, sound and HUD mods"));
+    ++content_notices;
+}
+
+/* A "modified" game (scripts/online_content.py) never starts a public search; character mods do. */
+static void test_public_content_gate(void) {
+    Notice saved = native_notice;
+    native_notice = content_notice;
+    void *result = (void *)1;
+    const int before = sent;
+    online_content_state = "modified";
+    start_search(&result, NULL, "{}", 3, NULL);
+    /* the notice at once; the search left only when its Continue is pressed */
+    assert(result == NULL && sent == before && content_notices == 1 && content_return == 1);
+    void *(ABI *vtable[])(void *) = {object_type};
+    void *pressed_meta[3] = {0, 0, "igGuiEventFocusInputPressed"};
+    void *press[5] = {vtable, pressed_meta, 0, (void *)8, 0};
+    unsigned char dialog_button[0xf0] = {0};
+    native_placeable_event = forward_event;
+    placeable_event(dialog_button, press);
+    assert(content_return == 2);
+    runtime_public_itemless_update();
+    assert(content_return == 0);
+    assert(!public_content_allowed() && content_notices == 2);      /* Ranked's GO TO LOBBY says it at once */
+    online_content_state = "characters";
+    assert(public_content_allowed() && content_notices == 2);
+    online_content_state = "unknown";            /* not checked (an older launcher): not refused */
+    assert(public_content_allowed() && content_notices == 2);
+    online_content_state = "clean";
+    native_notice = saved;
+}
+
 static void test_ranked_season_gate(void) {
     native_placeable_event = forward_event;
     native_make_handle = make_test_handle;
@@ -993,7 +1032,7 @@ static void test_native_party_menu_return(void) {
     root_meta[2]="Scripts.Graph.Octane_Lobby_ModeSelect_Root";
     placeable_event(root,event);
     native_placeable_event=saved_event;
-    assert(party_returns==old_returns+1 && stopped==old_stops+1);
+    assert(party_returns==old_returns && party_quits==1 && stopped==old_stops+1);
     assert(*party_manager==party && !party[0x6c] && selected && ranked_selected);
     assert(!search_mark && !matchmaking_search && !search_server_active && !matchmaking_room);
     strcpy(reply,"{\"state\":\"searching\",\"elapsed\":99,\"timeout\":180,\"range\":400,\"ranked\":true}");
@@ -1002,29 +1041,61 @@ static void test_native_party_menu_return(void) {
     (void)runtime_matchmaking_view(&elapsed,&timeout,&range,&ranked);
     int polls=requests;update_search_clock();
     assert(requests==polls && !search_poll_running);
-    runtime_public_itemless_menu_return();assert(party_returns==old_returns+1 && stopped==old_stops+1);
-    /* A new lobby can notify again; a follower never broadcasts a host return. */
-    menu_party_returned=0;runtime_public_itemless_menu_return();assert(party_returns==old_returns+2);
+    runtime_public_itemless_menu_return();assert(party_returns==old_returns && party_quits==1 && stopped==old_stops+1);
+    /* A new manual host exit leaves alone; a follower never broadcasts a host return. */
+    menu_party_returned=0;runtime_public_itemless_menu_return();assert(party_returns==old_returns && party_quits==2);
     *(int *)(connection+0x118)=2;party_guest=1;menu_party_returned=0;
-    runtime_public_itemless_menu_return();assert(party_returns==old_returns+2);
+    runtime_public_itemless_menu_return();assert(party_returns==old_returns && party_quits==2);
     matchmaking_search=1;search_mark=check_clock();search_elapsed_base=180;
     int attempts=timeout_attempts;runtime_public_itemless_update();
     assert(timeout_attempts==attempts && search_timeout_pending);
-    /* A host who came alone (no party before the room): leaving brings none of the room's
-     * players along; a party that came together goes back together. */
+    /* Every manual host exit leaves alone. Only queue timeout returns the party together. */
     *(int *)(connection+0x118)=1;party_guest=0;
     {
         const int returns=party_returns;
         menu_party_returned=0;party_at_entry=1;
         runtime_public_itemless_menu_return();
-        assert(party_returns==returns);
+        assert(party_returns==returns && party_quits==3);
         menu_party_returned=0;party_at_entry=2;
         runtime_public_itemless_menu_return();
-        assert(party_returns==returns+1);
-        /* A private room: nobody comes along, not even a party that came in together. */
+        assert(party_returns==returns && party_quits==4);
+        /* Private match follows the same host-migration rule. */
         menu_party_returned=0;party_at_entry=2;entry_private=1;
         runtime_public_itemless_menu_return();
-        assert(party_returns==returns+1 && party_quits==1);
+        assert(party_returns==returns && party_quits==5);
+        menu_party_returned=0;queue_return_pending=1;entry_private=0;
+        runtime_public_itemless_menu_return();
+        assert(party_returns==returns+1 && party_quits==5);
+        /* A guest of that room leaves the party on the way out: the host's notification
+         * (message 0x29) and the roster reset are the game's way out. */
+        const int saved_installed=installed;installed=1;
+        menu_party_returned=0;party_at_entry=2;entry_private=0;
+        *(int *)(connection+0x118)=2;party[0x6c]=1;
+        unsigned char roster[0x28]={0},peer[0x30]={0};
+        void *items[1]={peer};
+        *(int *)(roster+12)=1;*(void ***)(roster+0x20)=items;
+        *(void **)(party+0x30)=roster;
+        runtime_public_itemless_menu_return();
+        installed=saved_installed;
+        assert(party_quits==6 && party_returns==returns+1 && !party[0x6c]);
+        *(int *)(connection+0x118)=1;
+        native_party_reset_trace=reset_mock;
+        menu_party_returned=1;party_return_received=0;host_lost_return=-1;
+        traced_party_reset(party);assert(host_lost_return==0);
+        party_return_received=1;
+        traced_party_reset(party);assert(host_lost_return==1);
+        const int sessions=new_sessions;
+        entry_private=1;menu_party_returned=1;queue_return_pending=party_return_received=1;
+        runtime_public_itemless_takeover_host();
+        assert(new_sessions==sessions && !entry_private && !menu_party_returned &&
+               !queue_return_pending && !party_return_received);
+        runtime_public_itemless_menu_return();
+        assert(party_quits==7);
+        runtime_public_itemless_takeover_host();
+        assert(new_sessions==sessions && !menu_party_returned);
+        runtime_public_itemless_menu_return();
+        assert(party_quits==8);
+        new_sessions=sessions;
         /* The next search is not a private room any more. */
         arm_party_return();assert(!entry_private && !menu_party_returned);
         party_at_entry=1;
@@ -1036,8 +1107,92 @@ static void test_native_party_menu_return(void) {
     stopped=old_stops;selected=ranked_selected=0;strcpy(reply,"ok");
 }
 
-static int native_race_party_returns;
-static unsigned char ABI race_party_return_mock(void *sender,void *message,void *context) {
+/* The guest gets back to the main menu without passing the room's own screens: the party must
+ * still be left (its Lobby Members row and the host's notice), once per visit. */
+static void *ABI missing_field(void *meta,const char *name){(void)meta;(void)name;return NULL;}
+static void test_guest_main_menu_leaves_party(void) {
+    void *(ABI *graph_vtable[])(void*)={graph_type};
+    void *behavior_meta[3]={0,0,"igGuiVscBehavior"};
+    void *root_meta[3]={0,0,"Scripts.Graph.Octane_Lobby_PrivateGame_Root"};
+    unsigned char graph[0x40]={0},root[0xf0]={0};
+    *(void ***)graph=(void **)graph_vtable;
+    *(void **)(graph+8)=behavior_meta;
+    *(void **)(graph+0x20)=root_meta;
+    void *items[]={graph};
+    unsigned char behaviors[0x28]={0};
+    *(int *)(behaviors+12)=1;*(void ***)(behaviors+0x20)=items;
+    *(void **)(root+0xe8)=behaviors;
+    unsigned char party[0x80]={0},session[0x20]={0},connection[0x120]={0};
+    unsigned char roster[0x28]={0},peer[0x30]={0};
+    void *members[1]={peer},*party_value=party;
+    *(void **)(party+0x18)=session;*(void **)(session+0x10)=connection;
+    *(int *)(connection+0x118)=2;
+    *(void **)(party+0x30)=roster;*(int *)(roster+12)=1;*(void ***)(roster+0x20)=members;
+    void **saved_party=party_manager;
+    void (ABI *saved_quit)(void *)=native_party_quit_trace;
+    void *(ABI *saved_field)(void *,const char *)=native_meta_field;
+    const int saved_guest=party_guest,saved_quits=party_quits,saved_return=online_return_button;
+    party_manager=&party_value;native_party_quit_trace=quit_party_mock;native_meta_field=missing_field;
+    party_guest=1;guest_room_open=0;guest_quit_at=0;menu_party_returned=1;online_return_button=1;
+    /* ModeSelect is the setup screen before the room: not a room, no party leave. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_ModeSelect_Root";
+    native_return_focus(root,0);assert(!guest_room_open && party_quits==saved_quits);
+    /* The room itself (host: START GAME, guest: READY) marks the guest as in it. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_PrivateGame_Root";
+    native_return_focus(root,0);assert(guest_room_open && party_quits==saved_quits);
+    /* Back out lands on the room's setup screen: the guest leaves the party there. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_ModeSelect_Root";
+    native_return_focus(root,0);assert(party_quits==saved_quits+1 && !guest_room_open);
+    /* In the room again and out within 5 s: the native leave already ran once. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_PrivateGame_Root";
+    native_return_focus(root,0);assert(guest_room_open);
+    root_meta[2]="Scripts.Graph.Octane_Lobby_ModeSelect_Root";
+    native_return_focus(root,0);assert(party_quits==saved_quits+1 && !guest_room_open);
+    /* Straight to the main menu instead: same leave, the second visit counts. */
+    guest_quit_at=0;
+    root_meta[2]="Scripts.Graph.Octane_Lobby_PrivateGame_Root";
+    native_return_focus(root,0);assert(guest_room_open);
+    root_meta[2]="Scripts.Graph.Octane_Lobby_Main_Root";
+    native_return_focus(root,0);
+    assert(party_quits==saved_quits+2 && !guest_room_open);
+    /* In the room again and out within 5 s: the native leave already ran once. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_PrivateGame_Root";
+    native_return_focus(root,0);assert(guest_room_open);
+    root_meta[2]="Scripts.Graph.Octane_Lobby_ModeSelect_Root";
+    native_return_focus(root,0);assert(party_quits==saved_quits+2 && !guest_room_open);
+    /* "Waiting on host..." is not the room: it must not trigger a leave by itself. */
+    root_meta[2]="Scripts.Graph.Octane_Lobby_WaitingRoom_Root";
+    native_return_focus(root,0);assert(!guest_room_open && party_quits==saved_quits+2);
+    /* Leaving the host's session the game's own way means the same party leave; our own
+     * session's delete (closing a room we host) does not. */
+    guest_quit_at=0;
+    runtime_public_itemless_guest_left("cusa13795-session-LocalHost");
+    assert(party_quits==saved_quits+2);
+    runtime_public_itemless_guest_left("cusa13795-session-HostPlayer");
+    assert(party_quits==saved_quits+3);
+    runtime_public_itemless_guest_left("cusa13795-session-HostPlayer");
+    assert(party_quits==saved_quits+3);
+    /* The Lobby Members rows of a private room say the guest is inside it whatever screen has
+     * focus: out of the room leaves the party once, and a leave with no room open does nothing. */
+    guest_quit_at=0;
+    runtime_public_itemless_guest_room(0);
+    assert(party_quits==saved_quits+3 && !guest_room_open);
+    runtime_public_itemless_guest_room(1);
+    assert(guest_room_open && party_quits==saved_quits+3);
+    guest_quit_at=0;
+    runtime_public_itemless_guest_room(0);
+    assert(!guest_room_open && party_quits==saved_quits+4);
+    /* In the room again and out within 5 s: the native leave already ran once. */
+    runtime_public_itemless_guest_room(1);
+    runtime_public_itemless_guest_room(0);
+    assert(!guest_room_open && party_quits==saved_quits+4);
+    party_manager=saved_party;native_party_quit_trace=saved_quit;party_guest=saved_guest;
+    party_quits=saved_quits;online_return_button=saved_return;guest_room_open=0;
+    guest_quit_at=0;
+    native_meta_field=saved_field;
+}
+
+static int native_race_party_returns;static unsigned char ABI race_party_return_mock(void *sender,void *message,void *context) {
     assert(sender==(void *)1 && message==(void *)2 && context==(void *)3);
     ++native_race_party_returns;return 1;
 }
@@ -1112,6 +1267,14 @@ static void test_ranked_device_and_search_clock(void) {
     *(int *)(roster+12)=3;assert(ranked_party_size()==4);
     *(int *)(roster+12)=4;assert(ranked_party_size()==5);
     assert(!ranked_entry_allowed());
+    void *result=(void *)1;
+    runtime_public_itemless_reset();
+    int sent_before=sent,notices_before=ranked_notices;
+    Notice saved_notice=native_notice;native_notice=count_notice;
+    ranked_selected=1;
+    start_search(&result,NULL,"{\"members\":[1,2,3,4,5]}",25,NULL);
+    assert(!result && sent==sent_before && ranked_notices==notices_before+1 && !matchmaking_search);
+    native_notice=saved_notice;
     matchmaking_search=ranked_selected=1;
     runtime_public_itemless_update();
     assert(!matchmaking_search && !rejection[0]);
@@ -1160,7 +1323,9 @@ static void test_ranked_device_and_search_clock(void) {
 }
 
 int main(void) {
+    test_public_content_gate();
     test_ranked_device_and_search_clock();
+    test_guest_main_menu_leaves_party();
     test_native_party_menu_return();
     test_guest_menu_return_destination();
     native_deferred_event_create = allocate_input_event;
