@@ -32,6 +32,8 @@ int runtime_online_mode_private_cup(void) { return private_cup; }
 int runtime_online_mode_private_teams(void) { return private_teams; }
 int runtime_speed_mode_enabled(void) { return private_speed; }
 int runtime_online_mode_in_private(void) { return private_room; }
+static int lobby_open = 1;
+int runtime_online_mode_lobby_open(void) { return lobby_open; }
 static void *hof_test_wrapper, *hof_test_content;
 void *runtime_online_mode_content(void *placeable) { return placeable == hof_test_wrapper ? hof_test_content : NULL; }
 static void *hof_focused_project, *hof_focused_list;
@@ -44,6 +46,8 @@ void runtime_online_mode_selector_left(void) { ++selector_left_calls; }
 static int timeout_attempts, timeout_ready=1, timeout_route;
 int runtime_online_mode_matchmaking_cancel(int leave_room) { timeout_route=leave_room;++timeout_attempts;return timeout_ready; }
 int runtime_online_mode_matchmaking_timeout(void) { return runtime_online_mode_matchmaking_cancel(0); }
+static int return_mode;
+void runtime_online_mode_set_return_mode(int index) { return_mode = index; }
 static int new_sessions, hosted_sessions;
 void runtime_online_mode_new_session(void) { ++new_sessions; runtime_public_itemless_new_session(); }
 void runtime_room_mode_hosting(void) { ++hosted_sessions; }
@@ -62,12 +66,18 @@ static int block_get, entered_get;
 static char expected_ids[192];
 static char payload[4096], message[512], reply[512] = "ok";
 const char *runtime_np_get_online_name(void) { return "LocalHost"; }
+uint64_t runtime_ryunet_last_sent_ms(void) { return 0; } /* runtime_http.c: no send time here */
 int runtime_ryunet_request(const char *method, const char *target, char *body, size_t size) {
     ++requests;
     if (!strcmp(target,"/ryunet/theme")) {
         snprintf(body,size,"%s",reply); return status;
     }
     if (strstr(target,"/ryunet/matchmaking-status?")) { snprintf(body,size,"%s",reply); return status; }
+    /* Found-room / party-leave notifications (issue 0042): the client tells RyuNET the instant
+     * a player exits a found room, and polls whether a found room is still alive. */
+    if (!strcmp(method,"POST") && strstr(target,"/ryunet/room-left")) { snprintf(body,size,"ok"); return 200; }
+    if (!strcmp(method,"POST") && strstr(target,"/ryunet/room-short")) { snprintf(body,size,"ok"); return 200; }
+    if (!strcmp(method,"GET") && strstr(target,"/ryunet/room-alive")) { snprintf(body,size,"{\"players\":\"6\"}"); return 200; }
     if (!strcmp(method,"POST")) {
         assert(strstr(target,"/ryunet/itemless-client?name=LocalHost&version=1&nonce="));
         assert(strstr(target,"&release=" SACREDFIRE_RELEASE));
@@ -303,9 +313,10 @@ static void ABI resume_test_start(void *self) {
     ++resumed_starts;
 }
 static void prepare_public(void) {
-    if (!selected || rejection[0]) return;
-    expire_check(); char body[512];
-    (void)compatibility_check("/ryunet/ranked-party?name=LocalHost&members=1,2&mode=1",body,sizeof body);
+    if ((!selected && !ranked_selected) || rejection[0]) return;
+    expire_check(); char body[512], target[128];
+    snprintf(target,sizeof target,"/ryunet/ranked-party?name=LocalHost&members=1,2&mode=%d",selected);
+    (void)compatibility_check(target,body,sizeof body);
     await_check();
 }
 static void test_ranked(void) {
@@ -322,7 +333,8 @@ static void test_ranked(void) {
     ranked_selected = 1;
     expire_check();
     int before = sent;
-    /* The ranked check now waits inline instead of bouncing the player with a notice. */
+    /* A cold check never waits and never pops a modal: the press starts the search and the
+     * server validates the party in its own asynchronous startSearch. */
     start_search(&result, NULL, doc, sizeof doc, NULL);
     assert(result && sent == before + 1 && !rejection[0]);
     assert(strstr(payload, "\"octr_ranked\"") && !strstr(payload, "\"octr_itemless\""));
@@ -356,6 +368,7 @@ selected = 1;
     assert(!runtime_ranked_active());
     status = 404;
     expire_check();
+    prepare_public(); /* the lobby tick caches the refused answer */
     int before_unsupported = sent;
     start_search(&result, NULL, doc, sizeof doc, NULL);
     assert(!result && sent == before_unsupported && strstr(rejection, "Ranked server"));
@@ -363,6 +376,30 @@ selected = 1;
     status = 200;
     ranked_selected = 0;
     runtime_public_itemless_select(0);
+}
+/* A guest learns Ranked from the host's confirmation, then the host leaving fires a takeover:
+ * new_session wipes ranked_selected before takeover_host, so the sticky mode must restore it. */
+static void test_takeover_keeps_ranked(void) {
+    unsigned char owner[0x960] = {0};
+    uint64_t room = 777;
+    char confirmation[160];
+    int saved_ranked = ranked_selected, saved_joined = joined_ranked;
+    int saved_search_ranked = search_is_ranked;
+    ranked_selected = 0; joined_ranked = 0;
+    runtime_public_itemless_reset();
+    if (!registration_nonce) registration_nonce = 0x1111222233334444ULL;
+    request_nonce = registration_nonce; searching = 1; /* a ranked search owns this room */
+    matchmaking_room = room; matchmaking_owner = owner;
+    snprintf(confirmation, sizeof confirmation,
+             "{\"octr_ranked_v1\":\"2/%" PRIu64 "/0/%016" PRIx64 "\"}", room, request_nonce);
+    assert(accept(owner, room, confirmation, (unsigned)strlen(confirmation)));
+    assert(joined_ranked);
+    runtime_public_itemless_new_session();
+    assert(!ranked_selected && joined_ranked); /* the auto reset must not lose the sticky mode */
+    runtime_public_itemless_takeover_host();
+    assert(ranked_selected && search_is_ranked); /* re-search starts Ranked, not Casual */
+    runtime_public_itemless_reset();
+    ranked_selected = saved_ranked; joined_ranked = saved_joined; search_is_ranked = saved_search_ranked;
 }
 static void test_ranked_button_event(void) {
     native_placeable_event = forward_event;
@@ -1351,6 +1388,28 @@ int main(void) {
     setenv("BB_PUBLIC_ITEMLESS","1",1);
     snprintf(reply,sizeof reply,"ok"); status=200; requests=0;
 
+    /* The native map-vote handler runs on the game's thread: it never asks the server (a slow
+     * answer froze the game at 00), it reads the room-alive thread's latest answer. With none,
+     * the race goes ahead; with a short room, it says so (the report goes on a thread). */
+    matchmaking_room=77; joined_ranked=1;
+    int before_short=requests;
+    assert(runtime_public_ranked_short()==0);
+    assert(requests==before_short);
+    matchmaking_room=0; joined_ranked=0;
+    assert(runtime_public_ranked_short()==0);
+    matchmaking_room=78; joined_ranked=1;
+    pthread_mutex_lock(&ranked_clock_lock);
+    ranked_clock_room=78; ranked_clock_ready=-1; ranked_clock_players=2; ranked_clock_at=check_clock();
+    pthread_mutex_unlock(&ranked_clock_lock);
+    ranked_min_seen=3;
+    assert(runtime_public_ranked_short()==1);
+    assert(runtime_public_ranked_short()==1);   /* known for this room: no second report */
+    for (int wait = 0; wait < 200 && requests == before_short; ++wait) usleep(5000);   /* the report's thread */
+    assert(requests==before_short+1);
+    matchmaking_room=0; joined_ranked=0;
+    assert(runtime_public_ranked_short()==0);
+    ranked_min_seen=6;
+
     native_search=send_search; native_register=send_info; native_notice=show;
     network_manager=&test_network; native_stop_matchmaking=stop_matchmaking;
     native_return_to_lobby=return_to_lobby;
@@ -1444,6 +1503,7 @@ int main(void) {
     test_early_gate();
     test_full_lobby_confirmation();
     test_ranked();
+    test_takeover_keeps_ranked();
     test_ranked_button_event();
     test_native_return_focus();
     test_timeout_preserves_party_and_mode();

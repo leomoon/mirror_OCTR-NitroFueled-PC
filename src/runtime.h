@@ -113,6 +113,13 @@ int runtime_online_mode_in_private(void);
 int runtime_online_mode_lobby_open(void);        /* an online lobby is on screen */
 void runtime_online_mode_selector_left(void);
 void runtime_online_mode_note_frame(void);       /* the game's thread, every frame */
+/* A private room's member, for the overlay's members list by team (bbport_overlay.cpp mirrors it). */
+typedef struct { char name[40]; int team, ready, local; } TeamLobbyMember;
+int runtime_online_team_lobby(TeamLobbyMember *out, int max, int *teams);   /* any thread; -1 none */
+void runtime_online_team_request(int team);      /* the local player's team, picked in the room (any thread) */
+int runtime_online_team_requested(void);         /* that pick, -1 none */
+int runtime_online_team_color(int team, unsigned char rgb[3], char *name, size_t size);  /* palette index */
+int runtime_online_team_screen(float rects[4][4]);   /* team screen columns to draw (x, y, w on the 1080p canvas); 0 none */
 int runtime_online_mode_room_on(void);           /* in_private as of the last frame, for any thread */
 int runtime_online_mode_public_on(void);         /* a public match's lobby as of the last frame */
 void runtime_load_guard_note(const void *buffer, size_t size); /* the game's stdout/stderr writes: a level load that cannot finish restarts the game (runtime_load_guard.c) */
@@ -137,6 +144,13 @@ int runtime_public_itemless_announce(void);
 int runtime_public_itemless_active(void);
 int runtime_public_itemless_lobby_mode(void);
 int runtime_public_match_active(void);
+int runtime_public_found_room(void);
+uint64_t runtime_public_room(void);
+int runtime_public_ranked_short(void);
+int runtime_public_ranked_min_players(void); /* players a Ranked room needs, as the server said (0 until then: unknown) */
+int runtime_public_ranked_clock(int64_t *since_ms, int *players); /* 1: the server's Ranked countdown clock is fresh; since_ms -1 = short of players */
+int runtime_online_mode_room_players(void);   /* players in the online room (the game's list) */
+int runtime_online_mode_ranked_waiting(void);  /* a Ranked room short of players: countdown held, "WAITING 2/3" shown */
 int runtime_private_match_active(void);
 int runtime_online_party_active(void);
 /* 1 accepted, 0 rejected, -1 asynchronous check pending. */
@@ -146,6 +160,11 @@ int runtime_private_party_update(void);
 void runtime_private_party_cancel(void);
 int runtime_private_difficulty_modified(void);
 int runtime_public_itemless_selected(void);
+int runtime_public_itemless_match_active(void);
+void runtime_public_itemless_party_left_notice(void);
+void runtime_public_itemless_abort_queue(void);
+void runtime_public_itemless_poll_ranked_request(void); /* the game's thread: ryunet_ranked.txt (Discord Join) */
+int runtime_public_itemless_ranked_request_take(void);   /* Mode Select: the requested Ranked mode once, -1 none */
 void runtime_public_itemless_select(int enabled);
 int runtime_ranked_active(void);
 int runtime_ranked_selected(void);
@@ -187,11 +206,14 @@ int runtime_matchmaking_view(int *elapsed, int *timeout, int *range, int *ranked
 void runtime_online_mode_matchmaking_update(unsigned char *root);
 int runtime_online_mode_matchmaking_timeout(void);
 int runtime_online_mode_matchmaking_cancel(int route); /* 0 search, 1 room leave, 2 host-closed/Waiting Room */
+void runtime_online_mode_set_return_mode(int index); /* 0 Casual, 1 Itemless, 2 Ranked */
+int runtime_online_mode_return_mode(void);
 int runtime_speed_mode_enabled(void);
 int runtime_speed_race_active(void);
 void runtime_race_options_leave_room(void);
 void runtime_race_options_map_loading(const char *map);
 int runtime_race_options_start(unsigned char *image, size_t size);
+int runtime_profile_item_guard_start(unsigned char *image, size_t size); /* runtime_profile_guard.c */
 void runtime_race_options_stop_boost(void *boost, void (ABI *stop)(void *));
 int runtime_itemless_start(unsigned char *image, size_t size);
 int runtime_itemless_collisions_disabled(void);
@@ -285,6 +307,16 @@ void runtime_party_experiment_request(int kind); /* any thread: 1 leave+host, 2 
 int runtime_party_hosting(void);                 /* this player hosts its party */
 void runtime_party_host_lost(int role, int private_match, int announced_return); /* old host connection was torn down */
 void runtime_party_experiment_tick(void);          /* the game's thread, in an online lobby */
+/* Server-backed private-room parties (opt-in BB_PARTY_SERVER=1, runtime_party_server.c). */
+void runtime_party_server_init(void);
+int runtime_party_server_enabled(void);
+int runtime_party_server_create(const char *sid);         /* host: create on server */
+int runtime_party_server_join(const char *sid);           /* guest: join on server */
+int runtime_party_server_promote(const char *successor);  /* host: promote before quit */
+void runtime_party_server_tick(void);                     /* guest: poll for host change */
+void runtime_party_server_defer_promote(const char *successor); /* host: promote after a race ends */
+void runtime_party_server_matchmaking(int i_am_host, const char *host_name); /* shared session for a queue */
+void runtime_party_server_matchmaking_leave(void); /* queue quit: DELETE me from the shared session */
 void runtime_savedata_configure(const char *title);
 const char *runtime_savedata_title(void);
 /* The game's TITLE_ID: where its trophies are kept (<user>/trophies/<title>/). */
