@@ -965,6 +965,18 @@ def main():
     try:
         with launch_lock.session(Path(os.environ.get('BB_DATA_DIR', PORT))):
             return launch(args, restarted)
+    except PermissionError as error:
+        # Windows would not let the launch rewrite one of its own files in out/ (seen 20/11 with
+        # out/online-mode/cup-files.map): another SacredFire still open, or an antivirus holding it.
+        name = error.filename or ''
+        fail(f'Launch failed: Windows did not let SacredFire write {name} ({error.strerror or error}). '
+             'Another SacredFire or launcher may still be open in the background: look in the system tray '
+             'and in Task Manager (sacredfire.exe), close it and start again. If it keeps happening, an '
+             'antivirus or Controlled folder access is blocking the game folder: add it as an exclusion.\n'
+             f'No se pudo iniciar: Windows no dejó a SacredFire escribir {name}. Puede que otro SacredFire o '
+             'launcher siga abierto en segundo plano: búscalo en la bandeja del sistema y en el Administrador '
+             'de tareas (sacredfire.exe), ciérralo y vuelve a iniciar. Si sigue pasando, un antivirus o el '
+             'Acceso controlado a carpetas bloquea la carpeta del juego: agrégala como exclusión.')
     except (OSError, ValueError, RuntimeError, boot_cache.prepare.GameCheckError) as error:
         fail('Launch failed: ' + str(error))
 
@@ -1223,9 +1235,20 @@ def launch(args, restarted=False):
         # path and the patches read its settings (the player's, with the ones it was made for),
         # and it adds its archive patches, executable patch and HUD scale. Read again at a restart.
         layout_saved = {}
+        mod_file_map = {}   # 'mods': BB_MOD_FILE_MAP before the first pass (None: no map)
 
         def apply_layout():
             env.pop('BB_SPEED_MODE', None)
+            # Every pass starts from the mods' file map (or none), as the first one did: online mode
+            # below replaces BB_MOD_FILE_MAP with its own map (the mods' files and its own), and a
+            # second pass (a restart from the menu, a start that stopped and is tried again) read that
+            # one as its input: online mode then rebuilt, removed its old map and read it next
+            # ("[WinError 2] ... out/online-mode/cup-files.map", 20/11).
+            first_map = mod_file_map.setdefault('mods', env.get('BB_MOD_FILE_MAP'))
+            if first_map is None:
+                env.pop('BB_MOD_FILE_MAP', None)
+            else:
+                env['BB_MOD_FILE_MAP'] = first_map
             for key, value in layout_saved.items():
                 if value is None:
                     env.pop(key, None)

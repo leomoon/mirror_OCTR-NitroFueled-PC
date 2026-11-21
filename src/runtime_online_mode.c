@@ -239,6 +239,9 @@ static CompleteRacer complete_racer;
 struct CupTotal { uint64_t online_id; int id, human, points, finish_position; };
 static struct CupTotal finish_order[8];
 static int finish_order_count;
+/* The Ranked report frozen with it (freeze_ranked_report). */
+static struct runtime_ranked_racer ranked_report[8];
+static int ranked_report_count;
 static struct CupTotal team_results[8]; /* Indexed by validated host finish order. */
 static struct CupTotal cup_totals[8];
 static int cup_total_count;
@@ -825,7 +828,7 @@ void runtime_online_mode_new_session(void) {
     assign_handle((unsigned char *)&matchmaking_project, NULL);
     team_race_ui_owner = NULL;
     team_result_count = team_results_pending = team_score_opened = team_score_finished = team_effects_played = 0;
-    finish_order_count = cup_total_count = cup_result_count = private_grid_count = 0;
+    finish_order_count = cup_total_count = cup_result_count = private_grid_count = 0; ranked_report_count = 0;
     ranked_score_started = ranked_score_phase = ranked_score_finished = 0;
     if (race_manager && *race_manager) {
         unsigned char *manager = *race_manager;
@@ -968,12 +971,15 @@ static void ABI load_private_map(const char *map, int reason) {
     ranked_score_started = 0;
     ranked_score_phase = ranked_score_finished = 0;
     finish_order_count = 0;
+    ranked_report_count = 0;
     cup_timer_pending = 0;
     runtime_nsane_map_loading(map);
     runtime_race_options_map_loading(map);
     clear_team_selector();
     normalize_race_teams();
     const int team_return = team_ranking_project && map &&
+        !strcasecmp(map, "octane/octane_onlinelobby/octane_onlinelobby");
+    const int ranked_return = runtime_ranked_active() && map &&
         !strcasecmp(map, "octane/octane_onlinelobby/octane_onlinelobby");
     int next_mode = 0;
     if (race_manager && *race_manager) memcpy(&next_mode, (unsigned char *)*race_manager + 0xd40, 4);
@@ -1054,13 +1060,14 @@ static void ABI load_private_map(const char *map, int reason) {
         fputs("Native private CUP: could not enable fresh AI driver loading\n", stderr);
     ranked_race_rules(!lobby && runtime_ranked_active());
     original_load_map(map, reason);
-    if (incomplete_cup_return || team_return) {
+    if (incomplete_cup_return || team_return || ranked_return) {
         unsigned char *zone = find_zone(*zone_manager, map);
         unsigned char *data = zone ? pointer_at(zone, 0x1b0) : NULL;
         /* Online podium data can still contain track 1/2/3 after host loss. */
         if (data) {
             data[0x71] = 0;
             puts(team_return ? "Native private TEAM: no custom podium; returning to lobby" :
+                 ranked_return ? "Ranked: no podium; returning to the online room" :
                  "Native private CUP: skipped stale podium (no final host results)");
         }
     }
@@ -1618,6 +1625,52 @@ static int ABI team_race_order(unsigned char *a, unsigned char *b) {
     return racer_ahead(a, b);
 }
 
+/* A racer's finish from its lap records alone: the stamp of its last required lap (the network's lap
+ * timestamps, one clock on every game) when every required lap is recorded and in order, else 0. The
+ * finish flag (+0x8c) is not asked: a finish whose own message reached this game late, or never, still
+ * left its laps (docs/RANKED_ENDRACE_DESYNC_FIX.md, phase 2). laps/stamps: what is recorded, up to 7. */
+static int lap_finish_stamp(unsigned char *racer, int *laps, int stamps[7]) {
+    unsigned char *list = pointer_at(racer, 0x90);
+    int required = 0, completed = 0;
+    if (race_settings && *race_settings) memcpy(&required, *race_settings + 12, 4);
+    if (list) memcpy(&completed, list + 12, 4);
+    const int *times = list ? pointer_at(list, 0x20) : NULL;
+    if (laps) *laps = times && completed > 0 ? completed : 0;
+    for (int i = 0; stamps && i < 7; ++i) stamps[i] = times && i < completed ? times[i] : 0;
+    if (!times || required < 1 || required > 7 || completed < required) return 0;
+    for (int i = 0; i < required; ++i)
+        if (times[i] <= 0 || (i && times[i] <= times[i - 1])) return 0;
+    return times[required - 1];
+}
+
+/* The Ranked report as it was when the results came (docs/RANKED_ENDRACE_DESYNC_FIX.md, phase 1):
+ * names, finishes and stamps are read once here, while the racers are whole. The report is sent later
+ * from its own thread, after native callbacks may have recycled them. */
+static void freeze_ranked_report(void **items, int count, const struct CupTotal *order, int ordered) {
+    ranked_report_count = 0;
+    for (int rank = 0; rank < ordered; ++rank)
+        for (int i = 0; i < count; ++i) {
+            unsigned char *racer = items[i];
+            if (!racer) continue;
+            const struct CupTotal key = racer_identity(racer);
+            if (key.human != order[rank].human || key.id != order[rank].id || key.online_id != order[rank].online_id)
+                continue;
+            unsigned char *player = handle_object((void **)(racer + 0x10));
+            const char *name = player ? pointer_at(player, 0x68) : NULL;
+            if (!name || !*name) break;   /* an AI has no name to report; its slot stays */
+            struct runtime_ranked_racer *r = &ranked_report[ranked_report_count];
+            memset(r, 0, sizeof *r);
+            if (strlen(name) >= sizeof r->name) break;
+            strcpy(r->name, name);
+            r->time = lap_finish_stamp(racer, &r->laps, r->stamps);
+            r->finished = r->time > 0 || team_racer_finished(racer);
+            r->self = racer[0xb0] != 0;
+            r->pos = rank + 1;   /* the on-screen position: AIs keep their slots */
+            ++ranked_report_count;
+            break;
+        }
+}
+
 /* Freeze the validated host permutation before native callbacks can re-sort local state. */
 static int capture_finish_order(unsigned char *event) {
     if (!corrected_race_order()) return 1;
@@ -1627,6 +1680,7 @@ static int capture_finish_order(unsigned char *event) {
     void **items = list ? pointer_at(list, 0x20) : NULL;
     if (!items || count < 1 || count > 8) return 0;
     struct CupTotal order[8] = {0};
+    int times[8] = {0};
     unsigned occupied = 0;
     for (int i = 0; i < count; ++i) {
         if (!items[i]) return 0;
@@ -1644,43 +1698,36 @@ static int capture_finish_order(unsigned char *event) {
         if (position < 0) return 0;
         occupied |= 1u << position;
         order[position] = key;
+        times[position] = lap_finish_stamp(items[i], NULL, NULL);
     }
+    /* The host's order is who it saw finish first: a finish that reached it late put a faster racer
+     * behind slower ones, on every screen and in the Ranked report (20/11: 3rd in 3:34.76 shown 5th,
+     * behind 3:44.39 and 3:45.01, -45 MMR), or a winner among the DNFs when it never arrived (21/11,
+     * JarLster 1st in 2:59.38 scored DNF). Racers whose laps are all recorded come first, by the stamp
+     * of their last lap (the network's lap timestamps, the same on every game); the others keep the
+     * host's order after them. */
+    for (int i = 1; i < count; ++i)
+        for (int j = i; j > 0 && times[j] > 0 && (times[j - 1] == 0 || times[j] < times[j - 1]); --j) {
+            const struct CupTotal key = order[j];
+            const int time = times[j];
+            order[j] = order[j - 1], times[j] = times[j - 1];
+            order[j - 1] = key, times[j - 1] = time;
+            printf("Race results: player %d (%d) ahead of player %d (%d): the host had them the other "
+                   "way round\n", key.id, time, order[j].id, times[j]);
+        }
     memcpy(finish_order, order, sizeof order);
     finish_order_count = count;
+    freeze_ranked_report(items, count, order, count);
     return 1;
 }
 
 /* runtime_ranked.c: the validated finish order as the server scores it — the
  * in-game name of every racer, best first, with its finisher state. */
 int runtime_online_mode_ranked_order(struct runtime_ranked_racer *out, int max) {
-    if (!out || max < finish_order_count || finish_order_count < 1) return 0;
-    unsigned char *list = racer_manager && *racer_manager ? pointer_at(*racer_manager, 0x10) : NULL;
-    int count = 0;
-    if (list) memcpy(&count, list + 12, 4);
-    void **items = list ? pointer_at(list, 0x20) : NULL;
-    if (!items || count < 1 || count > 8) return 0;
-    int written = 0;
-    for (int rank = 0; rank < finish_order_count; ++rank) {
-        for (int i = 0; i < count; ++i) {
-            unsigned char *racer = items[i];
-            if (!racer) continue;
-            const struct CupTotal key = racer_identity(racer);
-            if (key.human != finish_order[rank].human || key.id != finish_order[rank].id ||
-                key.online_id != finish_order[rank].online_id) continue;
-            unsigned char *player = handle_object((void **)(racer + 0x10));
-            if (!player) break; /* an AI has no name to report */
-            const char *name = pointer_at(player, 0x68);
-            if (!name || !*name || strlen(name) >= sizeof out[written].name) break;
-            strcpy(out[written].name, name);
-            out[written].finished = team_result_count
-                ? !!(team_finished_mask & (1u << rank))
-                : team_racer_finished(racer);
-            out[written].pos = rank + 1; /* the on-screen position: AIs keep their slots */
-            ++written;
-            break;
-        }
-    }
-    return written;
+    /* the copy frozen when the results came (freeze_ranked_report), never the live racers */
+    if (!out || max < ranked_report_count || ranked_report_count < 1) return 0;
+    memcpy(out, ranked_report, (size_t)ranked_report_count * sizeof *out);
+    return ranked_report_count;
 }
 
 /* Freeze the final snapshot once, after native result handling. Late lap or
@@ -2580,6 +2627,8 @@ static void ABI private_race_timer_done(void) {
         }
     }
     if (runtime_ranked_active()) {
+        /* Ranked ends the room: go back to the online menu with the party so the
+         * next race starts from a fresh queue, not the finished room's map vote. */
         printf("Ranked: race countdown reached 0, quitting to main menu with party\n");
         const int ret_mode = runtime_public_itemless_lobby_mode() ? 1 : 0;
         runtime_online_mode_set_return_mode(ret_mode);
@@ -2636,6 +2685,15 @@ static void ABI private_guest_return_timer(unsigned char *self) {
     if (private_cup_race_active && current_cup() && index >= 0 && index < 3) {
         puts("Native private CUP: guest following host countdown; retaining session");
         schedule_guest_return(self, private_race_timer_done, self);
+        return;
+    }
+    if (runtime_ranked_active()) {
+        /* Ranked ends the room for everyone: leave with the party on the guest's
+         * own timer, not the native host handshake that stalled on Wumpa. The
+         * native quit-with-party sends the party leave, menu_return reports the
+         * room leave — no extra deadline, no waiting on the room host. */
+        puts("Ranked: guest ending race with the party");
+        private_race_timer_done();
         return;
     }
     original_guest_return_timer(self);
@@ -3699,13 +3757,56 @@ static int lobby_timer_texts(unsigned char **desc, unsigned char **value) {
 static float ranked_component_left = -1.0f;
 static uint64_t ranked_component_at;
 
-/* Ranked lobby timer: the port writes it. The game's timer GUI counts its number on its own from when
- * its menu opened, whatever the timer component says (the 20/11 dumps: no time in its behavior, only
- * state flags), so the players already waiting saw 45 or 40 when the last player came in while the
- * component, held at 60, started from 60 with everyone. The GUI's number is hidden and its label says
- * "WAITING 2/3" while the room is short, then "MATCH BEGINS IN 41" from the component's time. Set every
- * frame (set_text does nothing when the text is already that one). One short line: the label has no
- * second line and a longer text spills out of its box. */
+/* Ranked lobby timer, the timer artwork's own two lines (TimerDesc over TimerValue): while the room is
+ * short of its minimum the label reads "WAITING" and the number below reads "2/3"; from the minimum the
+ * label is the game's own and the number counts the map vote down, red and pulsing under ten seconds
+ * (the timer's own LowTime animation, played here so it follows the component's time, not the GUI's).
+ * The game's CGuiBehaviorTimer is stopped for this project: its update is the one counting and writing
+ * TimerValue and playing that pulse (the behavior's vtable +0xd8), so the port owns both lines. Only
+ * this instance's vtable is swapped, a copy: other timers of the game keep working. */
+static unsigned char *timer_value, *timer_writer;
+static BehaviorUpdate timer_native_update;
+static void **timer_vtable;
+static float timer_value_color[4], timer_value_scale[3];
+static uint64_t timer_pulse_at;
+
+static void ABI timer_update(unsigned char *self, unsigned char *owner, float dt) {
+    if (self == timer_writer) return;   /* the port writes this timer: no count, no pulse */
+    if (timer_native_update) timer_native_update(self, owner, dt);
+}
+
+/* Stop the game's timer of this project (found by the text it writes, +0x50). Retried until it is
+ * found; a project that opens later gets its own instance. */
+static void timer_stop_native(unsigned char *desc, unsigned char *value) {
+    if (timer_writer && pointer_at(timer_writer, 0) == timer_vtable) return;
+    unsigned char *behavior = NULL, *node = pointer_at(desc, 0x40);
+    for (int up = 0; node && up < 4 && !behavior; ++up, node = pointer_at(node, 0x40)) {
+        unsigned char *behaviors = pointer_at(node, 0xe8);
+        unsigned char *items = behaviors ? pointer_at(behaviors, 0x20) : NULL;
+        uint32_t count = 0;
+        if (behaviors) memcpy(&count, behaviors + 0x0c, 4);
+        for (uint32_t i = 0; items && count <= 16 && i < count; ++i) {
+            unsigned char *candidate = ((unsigned char **)items)[i];
+            if (candidate && pointer_at(candidate, 0x50) == value) { behavior = candidate; break; }
+        }
+    }
+    if (!behavior) return;
+    if (!timer_vtable) {
+        void **native = pointer_at(behavior, 0);
+        if (!native) return;
+        void **copy = malloc(0x100);
+        if (!copy) return;
+        memcpy(copy, native, 0x100);
+        timer_native_update = (BehaviorUpdate)copy[0xd8 / 8];
+        if (!timer_native_update) { free(copy); return; }
+        copy[0xd8 / 8] = (void *)timer_update;
+        timer_vtable = copy;
+    }
+    timer_writer = behavior;
+    memcpy(behavior, &timer_vtable, sizeof timer_vtable);
+    printf("Ranked lobby: the game's timer stopped (update %p)\n", (void *)timer_native_update);
+}
+
 static int ranked_waiting_players(void);
 static void ranked_waiting_timer(void) {
     static int shown;
@@ -3717,6 +3818,13 @@ static void ranked_waiting_timer(void) {
         if (!active) shown = 0;   /* that lobby is gone: a new one starts with its own timer */
         return;
     }
+    if (value != timer_value) {   /* a new timer project */
+        timer_value = value;
+        timer_pulse_at = 0;
+        timer_writer = NULL;
+        memcpy(timer_value_color, value + 0xc0, sizeof timer_value_color);
+        memcpy(timer_value_scale, value + 0x84, sizeof timer_value_scale);
+    }
     const int waiting = runtime_online_mode_ranked_waiting();
     const int timed = ranked_component_left >= 0.0f && monotonic_ms() - ranked_component_at < 1000;
     if (active && (waiting || timed)) {
@@ -3725,24 +3833,46 @@ static void ranked_waiting_timer(void) {
             snprintf(saved_desc, sizeof saved_desc, "%s", d && (uintptr_t)d >= 0x10000 ? d : "");
             printf("Ranked lobby: the port writes the timer (label \"%s\")\n", saved_desc);
         }
+        timer_stop_native(desc, value);
         char text[128];
+        int seconds = -1;
         if (waiting) {
-            snprintf(text, sizeof text, "%s %d/%d", runtime_text("WAITING"), ranked_waiting_players(),
+            snprintf(text, sizeof text, "%s", runtime_text("WAITING"));
+            set_text(desc, text);
+            snprintf(text, sizeof text, "%d/%d", ranked_waiting_players(),
                      runtime_public_ranked_min_players());
+            set_text(value, text);
         } else {
-            int seconds = (int)(ranked_component_left + 0.999f);
+            seconds = (int)(ranked_component_left + 0.999f);
             if (seconds < 0) seconds = 0;
             if (seconds > 99) seconds = 99;
-            snprintf(text, sizeof text, "%s %02d", saved_desc[0] ? saved_desc : "MATCH BEGINS IN", seconds);
+            if (saved_desc[0]) set_text(desc, saved_desc);
+            snprintf(text, sizeof text, "%02d", seconds);
+            set_text(value, text);
         }
-        set_text(desc, text);
-        if (hide_placeable) hide_placeable(value, 1);
+        if (hide_placeable) hide_placeable(value, 0);
+        if (seconds >= 0 && seconds <= 10) {
+            const uint64_t now = monotonic_ms();
+            if (now - timer_pulse_at >= 800) {   /* the animation runs 0.77 s: played again for a pulse */
+                static int told;
+                timer_pulse_at = now;
+                if (!told) { told = 1; puts("Ranked lobby: the timer's own LowTime animation (red pulse)"); }
+                if (gui_animation_tag_type && *gui_animation_tag_type)
+                    play_named_gui_animation(value, "LowTime");
+            }
+        } else {
+            memcpy(value + 0xc0, timer_value_color, sizeof timer_value_color);
+            memcpy(value + 0x84, timer_value_scale, sizeof timer_value_scale);
+        }
         shown = 1;
         return;
     }
     if (!shown) return;
     if (saved_desc[0]) set_text(desc, saved_desc);
     if (hide_placeable) hide_placeable(value, 0);
+    memcpy(value + 0xc0, timer_value_color, sizeof timer_value_color);
+    memcpy(value + 0x84, timer_value_scale, sizeof timer_value_scale);
+    timer_writer = NULL;   /* the game's timer runs again */
     shown = 0;
     puts("Ranked lobby: the game's timer is back");
 }
@@ -5953,10 +6083,12 @@ int runtime_online_mode_start(unsigned char *image, size_t size) {
     release_result_sound = (NativeEvent)(image + (0x149d260 - shift));
     set_animation_selector = (AnimationSelector)(image + 0xcb0c70);
     send_animation_event = (AnimationEvent)(image + 0xc64790);
-    create_gui_object = (GuiObjectFactory)(image + 0x14a0e30);
+    /* both 0x10 lower in the European game: unshifted, the Ranked timer's LowTime pulse and the Hall
+     * of Fame's cycling called into the middle of a function there (0xc000001d, 20/11) */
+    create_gui_object = (GuiObjectFactory)(image + (0x14a0e30 - shift));
     play_gui_animation = (GuiAnimation)(image + 0x250b20);
     initialize_gui_animation = (NativeEvent)(image + 0x9990b0);
-    release_gui_animation_tag = (NativeEvent)(image + 0x149d260);
+    release_gui_animation_tag = (NativeEvent)(image + (0x149d260 - shift));
     gui_animation_tag_type = (void **)(image + 0x2a21310);
     original_race_setup = (NativeEvent)(trampoline + 1280);
     assign_ai_teams = (NoArgument)(image + (0xe9dcf0 - shift));

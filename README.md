@@ -49,7 +49,8 @@ That covers menus, Adventure and Arcade, races, sound, cutscenes, Xbox/SDL contr
 keyboard, saving, the community patches (60 FPS, no motion blur), restart from the in-game menu,
 and the game's DLC from your own packages (optional). Internal resolution goes from 480p to native
 4K, with AMD FSR 1 or temporal upscaling (AMD FSR 3.1, or NVIDIA DLSS on RTX cards;
-experimental). The FPS limit keeps the game at 60 by default and goes up to 240.
+experimental). The FPS limit keeps the game at 60 by default and goes up to 240, or takes a custom
+value such as 75 for a 75 Hz screen.
 
 Since v0.5.3 the first start prepares the game's shaders for your GPU from your own dump (a few
 seconds, once: [shaders/README.md](shaders/README.md)), so new tracks and racers no longer stop
@@ -398,6 +399,22 @@ Import names from shadPS4's aerolib list.
 
 ## Recent releases
 
+- [v0.9.4](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.9.4): Ranked results no
+  longer stolen by a late finish (every game reports its own result; finishes recovered from the
+  laps); custom FPS limit (#272); Linux launcher platform settings and KDE 125% scaling.
+- [v0.9.3](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.9.3): older CPUs
+  (without MOVBE, BMI1 and LZCNT) start again; on them the 30 FPS free-flight correction stays off.
+- [v0.9.2](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.9.2): some saves no
+  longer stop the game before the main menu; no "cup-files.map" error when a start is tried again;
+  race results ordered by finish times; Pack Tacho's Yes/No in the game's language.
+- [v0.9.1](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.9.1): hotfix: the
+  European game no longer crashes in the Ranked timer's last seconds or the Hall of Fame; another
+  SacredFire left open in the background is named instead of a file error.
+- [v0.9.0](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.9.0): Ranked (Normal and
+  Itemless queues, MMR, ranks, seasons, Hall of Fame; a linked Discord or Steam account); voice chat
+  in rooms and races; private Cup, team and N.Sane modes; Pack Tacho built in; one launcher for
+  Windows and Linux with Steam login; DLSS Transformer K; translations and the European game at
+  par; Xbox controls diagram (#256) and Steam Deck controls (#258).
 - [v0.8.8](https://github.com/Ryu7w7/OCTR-NitroFueled-PC/releases/tag/v0.8.8): DirectX 11
   renderer (experimental, Windows; shaders prepared once in about 3 minutes); internal resolution,
   FPS unlock and motion blur apply without restarting (#230); a smoother, lighter Windows launcher;
